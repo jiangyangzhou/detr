@@ -35,7 +35,9 @@ class DETR(nn.Module):
         self.transformer = transformer
         hidden_dim = transformer.d_model
         self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
+        self.watch_inout = nn.Linear(hidden_dim, 1)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
+        self.gaze_heatmap = MLP(hidden_dim, hidden_dim, 64*64,  5)
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
         self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
         self.backbone = backbone
@@ -66,7 +68,13 @@ class DETR(nn.Module):
 
         outputs_class = self.class_embed(hs)
         outputs_coord = self.bbox_embed(hs).sigmoid()
-        out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
+        outputs_in_out = self.watch_inout(hs).sigmoid()
+        outputs_heatmap = self.gaze_heatmap(hs)
+        print(outputs_class.shape, outputs_coord.shape,  outputs_in_out.shape, outputs_heatmap.shape)
+        out = {'pred_logits': outputs_class[-1], 
+               'pred_boxes': outputs_coord[-1], 
+               "pred_in_out": outputs_in_out[-1],
+               "pred_heatmap": outputs_heatmap[-1]}
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
         return out
@@ -161,6 +169,44 @@ class SetCriterion(nn.Module):
         losses['loss_giou'] = loss_giou.sum() / num_boxes
         return losses
 
+    def loss_heatmap(self, outputs, targets, indices, num_boxes):
+        """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
+           targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
+           The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
+        """
+        assert 'pred_boxes' in outputs
+        idx = self._get_src_permutation_idx(indices)
+        src_heatmap = outputs['pred_heatmap'][idx]
+        target_heatmap = torch.cat([t['gaze_heatmap'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+
+        loss_l2 = F.l2_loss(src_heatmap, target_heatmap, reduction='none').mean(dim=1)
+        # gaze_inside = outputs['pred_in_out'][idx]
+        # loss_l2 = torch.mul(l2_loss, gaze_inside) # zero out loss when it's out-of-frame gaze case
+        # loss_l2 = torch.sum(l2_loss)/torch.sum(gaze_inside)
+        losses = {}
+        losses['loss_heatmap'] = loss_l2.sum() / num_boxes
+
+        return losses
+    
+    def loss_inside(self, outputs, targets, indices, num_boxes):
+        """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
+           targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
+           The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
+        """
+        assert 'pred_boxes' in outputs
+        idx = self._get_src_permutation_idx(indices)
+        src_inside = outputs['pred_inside'][idx]
+        target_inside = torch.cat([t['gaze_inside'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+
+        loss_bce = F.binary_cross_entropy(src_inside, target_inside, reduction='none').mean(dim=1)
+        # gaze_inside = outputs['pred_in_out'][idx]
+        # loss_l2 = torch.mul(l2_loss, gaze_inside) # zero out loss when it's out-of-frame gaze case
+        # loss_l2 = torch.sum(l2_loss)/torch.sum(gaze_inside)
+        losses = {}
+        losses['loss_inside'] = loss_bce.sum() / num_boxes
+
+        return losses
+    
     def loss_masks(self, outputs, targets, indices, num_boxes):
         """Compute the losses related to the masks: the focal loss and the dice loss.
            targets dicts must contain the key "masks" containing a tensor of dim [nb_target_boxes, h, w]
@@ -207,7 +253,9 @@ class SetCriterion(nn.Module):
             'labels': self.loss_labels,
             'cardinality': self.loss_cardinality,
             'boxes': self.loss_boxes,
-            'masks': self.loss_masks
+            'masks': self.loss_masks,
+            "heatmap": self.loss_heatmap,
+            "inside": self.loss_inside,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
